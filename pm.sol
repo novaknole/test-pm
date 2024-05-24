@@ -309,13 +309,27 @@ addresses that exist in parallel.
         if(msg.sender != applyCaller) {
             revert NotPossible();
         }
+
+        for (uint256 i; i < items.length; ) {
+            PermissionLib.SingleTargetPermission memory item = items[i];
+            Role storage role = roles[roleHash(_where, item.permissionId)];
+            if(role.isFrozen && item.operation == PermissionLib.Operation.Grant) {
+                revert NotPossible();
+            }           
+            // Note that if the item is `revoke`, we still allow tx to succed, 
+            // but `revoke` will have no effect
+        }
+
         
         for (uint256 i; i < items.length; ) {
             PermissionLib.SingleTargetPermission memory item = items[i];
 
+            // Loaded as "warm" and doesn't cost 2100 anymore, but 100.
+            Role storage role = roles[roleHash(_where, item.permissionId)];
+
             if (item.operation == PermissionLib.Operation.Grant) {
                 _grant({_where: _where, _who: item.who, _permissionId: item.permissionId});
-            } else if (item.operation == PermissionLib.Operation.Revoke) {
+            } else if (item.operation == PermissionLib.Operation.Revoke && !role.isFrozen) {
                 _revoke({_where: _where, _who: item.who, _permissionId: item.permissionId});
             } else if (item.operation == PermissionLib.Operation.GrantWithCondition) {
                 revert GrantWithConditionNotSupported();
@@ -336,12 +350,25 @@ addresses that exist in parallel.
             revert NotPossible();
         }
 
+        for (uint256 i; i < items.length; ) {
+            PermissionLib.SingleTargetPermission memory item = items[i];
+            Role storage role = roles[roleHash(_where, item.permissionId)];
+            if(role.isFrozen && item.operation == PermissionLib.Operation.Grant) {
+                revert NotPossible();
+            }           
+            // Note that if the item is `revoke`, we still allow tx to succed, 
+            // but `revoke` will have no effect
+        }
+
         for (uint256 i; i < _items.length; ) {
             PermissionLib.MultiTargetPermission memory item = _items[i];
 
+            // Loaded as "warm" and doesn't cost 2100 anymore, but 100.
+            Role storage role = roles[roleHash(_where, item.permissionId)];
+            
             if (item.operation == PermissionLib.Operation.Grant) {
                 _grant({_where: item.where, _who: item.who, _permissionId: item.permissionId});
-            } else if (item.operation == PermissionLib.Operation.Revoke) {
+            } else if (item.operation == PermissionLib.Operation.Revoke && !role.isFrozen) {
                 _revoke({_where: item.where, _who: item.who, _permissionId: item.permissionId});
             } else if (item.operation == PermissionLib.Operation.GrantWithCondition) {
                 _grantWithCondition({
