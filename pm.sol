@@ -32,6 +32,30 @@ abstract contract PermissionManager is Initializable {
 allowed, or redirecting to a `PermissionCondition`).
     mapping(bytes32 => address) internal permissionsHashed;
 
+    enum Option {
+        NONE,
+        canAdd,
+        canRemove,
+        canBoth
+    }
+
+    struct Access {
+        Option option;
+        uint48 since;
+        bool isManager;
+    }
+
+    struct Role {
+        bool isFrozen;
+        bool isFresh;
+        mapping(address => Access) members;
+    }
+
+    mapping(bytes32 => Role) internal roles;
+
+    address public pspRegistry;
+    address public applyCaller;
+
     /// @notice Thrown if a call is unauthorized.
     /// @param where The context in which the authorization reverted.
     /// @param who The address (EOA or contract) missing the permission.
@@ -103,12 +127,124 @@ allowed, or redirecting to a `PermissionCondition`).
         _;
     }
 
+    modifier onlyPermissionManager(address _where, bytes32 _permissionId) {
+        Role storage role = roles[roleHash(_where, _permissionId)];
+        
+        // role has been frozen. So nobody can do anything anymore on this.
+        if(role.isFrozen){
+            revert NotPossible();
+        }
+
+        bool isRoot = isGranted(address(this), msg.sender, ROOT_PERMISSION_ID, "0x");
+
+        // role hasn't been assigned a PM and hasn't been frozen.
+        // In this case, this operation can only be permitted by ROOT Holder.
+        if(role.isFresh) {
+            if(!isRoot) {
+                revert NotPossible();
+            }
+        } else if(!role.members[msg.sender].isManager) {
+            revert NotPossible();
+        }
+    }
+
     /// @notice Initialization method to set the initial owner of the permission manager.
     /// @dev The initial owner is granted the `ROOT_PERMISSION_ID` permission.
     /// @param _initialOwner The initial owner of the permission manager.
-    function __PermissionManager_init(address _initialOwner) internal onlyInitializing {
+    function __PermissionManager_init(
+        address _initialOwner, 
+        address _pspRegistry,
+        address _applyCaller
+    ) internal onlyInitializing {
         _initializePermissionManager({_initialOwner: _initialOwner});
+
+        pspRegistry = _pspRegistry;
+
+         _setApplyCaller(_applyCaller);
     }
+
+    // This is called only when contract is being upgraded to.
+    function initializeV2(
+        address _pspRegistry, 
+        address _applyCaller
+    ) external initializer(2) {
+        pspRegistry = _pspRegistry;
+
+        _setApplyCaller(_applyCaller);
+    }
+
+    function _setApplyCaller(address _applyCaller) private {
+        if(!pspRegistry.isValid(_applyCaller)) {
+            revert NotPossible();
+        }
+
+        applyCaller = _applyCaller;
+    }
+
+    function setApplyCaller(address _applyCaller) external auth(ROOT_PERMISSION_ID) {
+        _setApplyCaller(_applyCaller);
+    }
+
+    function freezeRole(address _where, bytes32 _permissionId) external auth(ROOT_PERMISSION_ID) {
+        Role storage role = roles[roleHash(_where, _permissionId)];
+
+        role.isFrozen = true;
+    }
+    
+    function updateManagers(
+        address _where, 
+        bytes32 _permissionId, 
+        address[] members,
+        bool _update
+    ) external {
+        Role storage role = roles[roleHash(_where, _permissionId)];
+
+        // Role has been frozen, so nobody can do anything on it.
+        if(role.isFrozen) {
+            revert NotPossible();
+        }
+
+        // Just because caller is the ROOT or manager, he still can't update managers unless
+        // he was assigned a special right by the ROOT when he got chosen as a manager.
+        Access access = role.members[msg.sender];
+
+        if(access.option == Option.NONE) {
+            revert NotPossible();
+        }
+        
+        if(_update) {
+            if(access.option == Option.canRemove) {
+                revert NotPossible();
+            }
+        } else {
+            if(access.option == Option.canAdd) {
+                revert NotPossible();
+            }
+        }
+
+        for(uint256 i = 0; i < members.length; i++) {
+            role.members[members[i]].isManager = _update;
+        }
+    }
+
+    function grantWithDelay(
+        address _where,
+        address _who,
+        bytes32 _permissionId,
+        uint48 _delay
+    ) external virtual onlyPermissionManager(_where, _permissionId) {
+        _grant({_where: _where, _who: _who, _permissionId: _permissionId});
+
+        Role storage role = roles[roleHash(_where, _permissionId)];
+
+        // new member
+        if(role.members[_who].since == 0) {
+            role.members[_who].since = block.timestamp + _delay;
+        } else {
+            role.members[_who].since += _delay;
+        }
+    }
+
 
     /// @notice Grants permission to an address to call methods in a contract guarded by an auth modifier with the specified permission identifier.
     /// @dev Requires the `ROOT_PERMISSION_ID` permission.
@@ -121,7 +257,7 @@ addresses that exist in parallel.
         address _where,
         address _who,
         bytes32 _permissionId
-    ) external virtual auth(ROOT_PERMISSION_ID) {
+    ) external virtual onlyPermissionManager(_where, _permissionId) {
         _grant({_where: _where, _who: _who, _permissionId: _permissionId});
     }
 
@@ -139,7 +275,7 @@ addresses that exist in parallel.
         address _who,
         bytes32 _permissionId,
         IPermissionCondition _condition
-    ) external virtual auth(ROOT_PERMISSION_ID) {
+    ) external virtual onlyPermissionManager(_where, _permissionId) {
         _grantWithCondition({
             _where: _where,
             _who: _who,
@@ -159,7 +295,7 @@ addresses that exist in parallel.
         address _where,
         address _who,
         bytes32 _permissionId
-    ) external virtual auth(ROOT_PERMISSION_ID) {
+    ) external virtual onlyPermissionManager(_where, _permissionId) {
         _revoke({_where: _where, _who: _who, _permissionId: _permissionId});
     }
 
@@ -169,13 +305,31 @@ addresses that exist in parallel.
     function applySingleTargetPermissions(
         address _where,
         PermissionLib.SingleTargetPermission[] calldata items
-    ) external virtual auth(ROOT_PERMISSION_ID) {
+    ) external virtual  {
+        if(msg.sender != applyCaller) {
+            revert NotPossible();
+        }
+
+        for (uint256 i; i < items.length; ) {
+            PermissionLib.SingleTargetPermission memory item = items[i];
+            Role storage role = roles[roleHash(_where, item.permissionId)];
+            if(role.isFrozen && item.operation == PermissionLib.Operation.Grant) {
+                revert NotPossible();
+            }           
+            // Note that if the item is `revoke`, we still allow tx to succed, 
+            // but `revoke` will have no effect
+        }
+
+        
         for (uint256 i; i < items.length; ) {
             PermissionLib.SingleTargetPermission memory item = items[i];
 
+            // Loaded as "warm" and doesn't cost 2100 anymore, but 100.
+            Role storage role = roles[roleHash(_where, item.permissionId)];
+
             if (item.operation == PermissionLib.Operation.Grant) {
                 _grant({_where: _where, _who: item.who, _permissionId: item.permissionId});
-            } else if (item.operation == PermissionLib.Operation.Revoke) {
+            } else if (item.operation == PermissionLib.Operation.Revoke && !role.isFrozen) {
                 _revoke({_where: _where, _who: item.who, _permissionId: item.permissionId});
             } else if (item.operation == PermissionLib.Operation.GrantWithCondition) {
                 revert GrantWithConditionNotSupported();
@@ -192,12 +346,29 @@ addresses that exist in parallel.
     function applyMultiTargetPermissions(
         PermissionLib.MultiTargetPermission[] calldata _items
     ) external virtual auth(ROOT_PERMISSION_ID) {
+        if(msg.sender != applyCaller) {
+            revert NotPossible();
+        }
+
+        for (uint256 i; i < items.length; ) {
+            PermissionLib.SingleTargetPermission memory item = items[i];
+            Role storage role = roles[roleHash(_where, item.permissionId)];
+            if(role.isFrozen && item.operation == PermissionLib.Operation.Grant) {
+                revert NotPossible();
+            }           
+            // Note that if the item is `revoke`, we still allow tx to succed, 
+            // but `revoke` will have no effect
+        }
+
         for (uint256 i; i < _items.length; ) {
             PermissionLib.MultiTargetPermission memory item = _items[i];
 
+            // Loaded as "warm" and doesn't cost 2100 anymore, but 100.
+            Role storage role = roles[roleHash(_where, item.permissionId)];
+            
             if (item.operation == PermissionLib.Operation.Grant) {
                 _grant({_where: item.where, _who: item.who, _permissionId: item.permissionId});
-            } else if (item.operation == PermissionLib.Operation.Revoke) {
+            } else if (item.operation == PermissionLib.Operation.Revoke && !role.isFrozen) {
                 _revoke({_where: item.where, _who: item.who, _permissionId: item.permissionId});
             } else if (item.operation == PermissionLib.Operation.GrantWithCondition) {
                 _grantWithCondition({
@@ -227,6 +398,9 @@ this was declared during the granting process.
         bytes32 _permissionId,
         bytes memory _data
     ) public view virtual returns (bool) {
+        
+        bytes32 hash = roleHash(_where, _permissionId);
+
         // Specific caller (`_who`) and target (`_where`) permission check
         {
             // This permission may have been granted directly via the `grant` function or with a condition via the `grantWithCondition` function.
@@ -234,10 +408,21 @@ this was declared during the granting process.
                 permissionHash({_where: _where, _who: _who, _permissionId: _permissionId})
             ];
 
-            // If the permission was granted directly, return `true`.
-            if (specificCallerTargetPermission == ALLOW_FLAG) return true;
+            // TODO: better comment needed
+            // If the permission was granted directly, return `true` deciding on delay.
+            if (specificCallerTargetPermission == ALLOW_FLAG) {
+                uint48 since = roles[hash].members[_who].since;
+
+                if(since == 0 || since <= block.timestamp) {
+                    return true;
+                }
+                
+                return false;
+            }
 
             // If the permission was granted with a condition, check the condition and return the result.
+            // TODO: shall we also add the check for `since` or should the condition's result be one final say
+            // whether user is allowed or not(i.e bypassing the "since")
             if (specificCallerTargetPermission != UNSET_FLAG) {
                 return
                     _checkCondition({
@@ -252,6 +437,7 @@ this was declared during the granting process.
             // If this permission is not set, continue.
         }
 
+        // TODO: I don't think there's a need to have a delay(since) checks for ANY_ADDR.
         // Generic caller (`_who: ANY_ADDR`) condition check
         {
             // This permission can only be granted in conjunction with a condition via the `grantWithCondition` function.
@@ -273,6 +459,7 @@ this was declared during the granting process.
             // If this permission is not set, continue.
         }
 
+        // TODO: I don't think there's a need to have a delay(since) checks for ANY_ADDR.
         // Generic target (`_where: ANY_ADDR`) condition check
         {
             // This permission can only be granted in conjunction with a condition via the `grantWithCondition` function.
@@ -459,6 +646,14 @@ addresses that might have been granted in parallel.
         if (permissionsHashed[permHash] != UNSET_FLAG) {
             permissionsHashed[permHash] = UNSET_FLAG;
 
+            Role storage role = roles[roleHash(_where, _permissionId)];
+
+            if (role.members[account].since == 0) {
+                return false;
+            }
+
+            delete role.members[account];
+
             emit Revoked({permissionId: _permissionId, here: msg.sender, where: _where, who: _who});
         }
     }
@@ -487,6 +682,18 @@ permission, and the permission identifier.
         bytes32 _permissionId
     ) internal pure virtual returns (bytes32) {
         return keccak256(abi.encodePacked("PERMISSION", _who, _where, _permissionId));
+    }
+
+    /// @notice Generates the hash for the `permissionsHashed` mapping obtained from the word "PERMISSION", the contract address, the address owning the 
+permission, and the permission identifier.
+    /// @param _where The address of the target contract for which `_who` receives permission.
+    /// @param _permissionId The permission identifier.
+    /// @return The role hash.
+    function roleHash(
+        address _where,
+        bytes32 _permissionId
+    ) internal pure virtual returns (bytes32) {
+        return keccak256(abi.encodePacked("ROLE", _where, _permissionId));
     }
 
     /// @notice Decides if the granting permissionId is restricted when `_who == ANY_ADDR` or `_where == ANY_ADDR`.
